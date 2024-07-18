@@ -16,11 +16,188 @@ import torch.utils.data
 from torchvision.transforms import RandomCrop
 from torchvision import transforms as tf
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
-from src.utils import RepresentationType, VoxelGrid, flow_16bit_to_float
+from .utils import RepresentationType, VoxelGrid, flow_16bit_to_float
 
 VISU_INDEX = 1
+
+#PreProcessing========================================================================
+def check_data_consistency(event_data):
+    lengths = [len(event_data[key]) for key in event_data]
+    if len(set(lengths)) != 1:
+        raise ValueError("Inconsistent data lengths after denoise")
+
+#累積イベント画像生成
+def generate_accumulated_event_image(events, height, width):
+    acc_image = np.zeros((height, width))
+
+    for x, y, t, p in zip(events['x'], events['y'], events['t'], events['p']):
+        acc_image[y, x] += p
+
+    return acc_image
+
+#タイムサーフェスの生成
+def generate_time_surface(events, height, width):
+    time_surface = np.zeros((height, width))
+
+    for x, y, t, p in zip(events['x'], events['y'], events['t'], events['p']):
+        time_surface[y, x] = t
+
+    return time_surface
+
+#ノイズ除去
+def spatial_denoise(events, neighborhood_size=3, threshold=1000):
+    height = int(np.max(events['y']) + 1)
+    width = int(np.max(events['x']) + 1)
+    event_count = np.zeros((height, width), dtype=np.int32)
+
+    for x, y in tqdm(zip(events['x'], events['y'])):
+        if x < 0 or y < 0:
+            continue  # Skip negative coordinates
+        event_count[int(y), int(x)] += 1
+
+    denoised_events = {'x': [], 'y': [], 't': [], 'p': []}
+
+    for x, y, t, p in zip(events['x'], events['y'], events['t'], events['p']):
+        x = int(x)
+        y = int(y)
+        if x < 0 or y < 0:
+            continue  # Skip negative coordinates
+        x_min, x_max = max(0, x - neighborhood_size), min(width, x + neighborhood_size + 1)
+        y_min, y_max = max(0, y - neighborhood_size), min(height, y + neighborhood_size + 1)
+        if event_count[y_min:y_max, x_min:x_max].sum() > threshold:
+            denoised_events['x'].append(x)
+            denoised_events['y'].append(y)
+            denoised_events['t'].append(t)
+            denoised_events['p'].append(p)
+
+    # Ensure the consistency of the data
+    for key in denoised_events:
+        denoised_events[key] = np.array(denoised_events[key])
+    check_data_consistency(denoised_events)
+
+    return denoised_events
+
+def temporal_denoise(events, time_window=5):
+    t = events['t']
+    n = len(t)
+    denoised_events = {'x': [], 'y': [], 't': [], 'p': []}
+
+    # すべてのイベントをスキャンして、各イベントの周囲のイベント数を累積和で計算
+    event_count = np.zeros(n, dtype=int)
+    j = 0
+
+    for i in tqdm(range(n), desc="Temporal Denoise"):
+        while j < n and t[j] <= t[i] + time_window:
+            j += 1
+        event_count[i] = j - i
+
+    # デノイズされたイベントを収集
+    for i in range(n):
+        if event_count[i] > 1:
+            denoised_events['x'].append(events['x'][i])
+            denoised_events['y'].append(events['y'][i])
+            denoised_events['t'].append(events['t'][i])
+            denoised_events['p'].append(events['p'][i])
+
+    # 配列に変換
+    return {k: np.array(v) for k, v in denoised_events.items()}
+
+#正規化
+def normalize_events(events):
+    t_min, t_max = events['t'].min(), events['t'].max()
+    if t_max == t_min:
+        events['t'] = np.zeros_like(events['t'])
+    else:
+        events['t'] = (events['t'] - t_min) / (t_max - t_min)
+    return events
+
+
+#====================================================================================
+
+class PreprocessedDataset(Dataset):
+    def __init__(self, original_dataset):
+        self.original_dataset = original_dataset
+        self.preprocessed_data = self.preprocess_events(
+            [self.original_dataset.get_data(i) for i in range(len(self.original_dataset))])
+
+    def preprocess_events(self, samples_list):
+        preprocessed_events = []
+        for sample in tqdm(samples_list, desc="Preprocessing events"):
+            event_volume = sample['event_volume']
+            event_data1 = {
+                'p': event_volume[0].numpy().flatten(),
+                'x': event_volume[1].numpy().flatten(),
+                'y': event_volume[2].numpy().flatten(),
+                't': event_volume[3].numpy().flatten()
+            }
+            event_data2 = {
+                'p': event_volume[4].numpy().flatten(),
+                'x': event_volume[5].numpy().flatten(),
+                'y': event_volume[6].numpy().flatten(),
+                't': event_volume[7].numpy().flatten()
+            }
+            if event_data1['t'].min() == event_data1['t'].max() or event_data2['t'].min() == event_data2['t'].max():
+                print("無効なタイムスタンプ範囲のイベントデータをスキップします。")
+                continue
+            event_data1 = normalize_events(event_data1)
+            event_data2 = normalize_events(event_data2)
+            if len(event_data1['x']) == 0 or len(event_data2['x']) == 0:
+                print("Skipping empty event data after normalization.")
+                continue
+            event_data1 = spatial_denoise(event_data1)
+            event_data2 = spatial_denoise(event_data2)
+            if len(event_data1['x']) == 0 or len(event_data2['x']) == 0:
+                print("Skipping empty event data after spatial denoise.")
+                continue
+            # event_data1 = temporal_denoise(event_data1)
+            # event_data2 = temporal_denoise(event_data2)
+            # if len(event_data1['x']) == 0 or len(event_data2['x']) == 0:
+            #     print("Skipping empty event data after temporal denoise.")
+            #     continue
+            preprocessed_events.append((event_data1, event_data2))
+        return preprocessed_events
+
+    def __len__(self):
+        return len(self.preprocessed_data)
+
+    def __getitem__(self, idx):
+        event_data1, event_data2 = self.preprocessed_data[idx]
+        p1, t1, x1, y1 = event_data1['p'], event_data1['t'], event_data1['x'], event_data1['y']
+        p2, t2, x2, y2 = event_data2['p'], event_data2['t'], event_data2['x'], event_data2['y']
+
+        if len(x1) == 0 or len(x2) == 0 or len(y1) == 0 or len(y2) == 0:
+            raise ValueError("Empty x or y arrays found during preprocessing")
+
+        xy_rect1 = self.original_dataset.rectify_events(x1, y1)
+        x_rect1, y_rect1 = xy_rect1[:, 0], xy_rect1[:, 1]
+        xy_rect2 = self.original_dataset.rectify_events(x2, y2)
+        x_rect2, y_rect2 = xy_rect2[:, 0], xy_rect2[:, 1]
+
+        if self.original_dataset.voxel_grid is None:
+            raise NotImplementedError
+        else:
+            event_representation1 = self.original_dataset.events_to_voxel_grid(p1, t1, x_rect1, y_rect1)
+            event_representation2 = self.original_dataset.events_to_voxel_grid(p2, t2, x_rect2, y_rect2)
+            event_representation = torch.cat((event_representation1, event_representation2), dim=0)
+
+            # 5次元テンソルを4次元に変換
+            if event_representation.dim() == 5:
+                batch_size, seq_len, channels, height, width = event_representation.shape
+                event_representation = event_representation.view(batch_size * seq_len, channels, height, width)
+
+            output = {'event_volume': event_representation}
+
+        output['name_map'] = self.original_dataset.name_idx
+
+        if self.original_dataset.load_gt:
+            output['flow_gt'] = [torch.tensor(x) for x in
+                                 self.original_dataset.load_flow(self.original_dataset.flow_png[idx])]
+            output['flow_gt'][0] = torch.moveaxis(output['flow_gt'][0], -1, 0)
+            output['flow_gt'][1] = torch.unsqueeze(output['flow_gt'][1], 0)
+        return output
 
 
 class EventSlicer:
@@ -91,6 +268,11 @@ class EventSlicer:
             events[dset_str] = np.asarray(
                 self.events[dset_str][t_start_us_idx:t_end_us_idx])
             assert events[dset_str].size == events['t'].size
+
+        # Reverse the arrays
+        for key in events:
+            events[key] = events[key][::-1]
+
         return events
 
     @staticmethod
@@ -210,37 +392,24 @@ class Sequence(Dataset):
         self.visualize_samples = visualize
         self.load_gt = load_gt
         self.transforms = transforms
-        if self.mode == "test":
-            assert load_gt == False
-            # Get Test Timestamp File
-            ev_dir_location = seq_path / 'events_left'
-            timestamp_file = seq_path / 'forward_timestamps.txt'
-            flow_path = seq_path / 'flow_forward'
-            timestamps_flow = np.loadtxt(
-                seq_path / 'forward_timestamps.txt', delimiter=',', dtype='int64')
-            self.indices = np.arange(len(timestamps_flow))
-            self.timestamps_flow = timestamps_flow[:, 0]
 
-        elif self.mode == "train":
-            ev_dir_location = seq_path / 'events_left'
-            flow_path = seq_path / 'flow_forward'
-            timestamp_file = seq_path / 'forward_timestamps.txt'
-            self.flow_png = [Path(os.path.join(flow_path, img)) for img in sorted(
-                os.listdir(flow_path))]
-            timestamps_flow = np.loadtxt(
-                seq_path / 'forward_timestamps.txt', delimiter=',', dtype='int64')
-            self.indices = np.arange(len(timestamps_flow))
-            self.timestamps_flow = timestamps_flow[:, 0]
-        else:
-            pass
+        ev_dir_location = seq_path / 'events_left'
+        timestamp_file = seq_path / 'forward_timestamps.txt'
         assert timestamp_file.is_file()
 
-        file = np.genfromtxt(
-            timestamp_file,
-            delimiter=','
-        )
+        timestamps_flow = np.loadtxt(timestamp_file, delimiter=',', dtype='int64')
+        self.indices = np.arange(len(timestamps_flow))
+        self.timestamps_flow_start = timestamps_flow[:, 0]
+        self.timestamps_flow_end = timestamps_flow[:, 1]
 
-        self.idx_to_visualize = file[:, 2] if file.shape[1] == 3 else []
+        if self.mode == "train":
+            flow_path = seq_path / 'flow_forward'
+            self.flow_png = [Path(os.path.join(flow_path, img)) for img in sorted(os.listdir(flow_path))]
+        else:
+            self.flow_png = []
+
+        # idx_to_visualizeの初期化
+        self.idx_to_visualize = self.indices if visualize else []
 
         # Save output dimensions
         self.height = 480
@@ -266,8 +435,9 @@ class Sequence(Dataset):
 
 
     def events_to_voxel_grid(self, p, t, x, y, device: str = 'cpu'):
+        #t = t[::-1]
         t = (t - t[0]).astype('float32')
-        t = (t/t[-1])
+        t = (t / t[-1])
         x = x.astype('float32')
         y = y.astype('float32')
         pol = p.astype('float32')
@@ -304,7 +474,8 @@ class Sequence(Dataset):
         return self.height, self.width
 
     def __len__(self):
-        return len(self.timestamps_flow)
+        #return 1
+        return len(self.timestamps_flow_start)
 
     def rectify_events(self, x: np.ndarray, y: np.ndarray):
         # assert location in self.locations
@@ -315,52 +486,60 @@ class Sequence(Dataset):
         assert x.max() < self.width
         assert y.max() < self.height
         return rectify_map[y, x]
-    
+
     def get_data(self, index) -> Dict[str, any]:
-        ts_start: int = self.timestamps_flow[index] - self.delta_t_us
-        ts_end: int = self.timestamps_flow[index]
+        ts_start1 = self.timestamps_flow_start[index]
+        ts_end1 = self.timestamps_flow_end[index]
+        ts_start2 = self.timestamps_flow_start[min(index + 1, len(self.timestamps_flow_start) - 1)]
+        ts_end2 = self.timestamps_flow_end[min(index + 1, len(self.timestamps_flow_end) - 1)]
 
         file_index = self.indices[index]
 
         output = {
             'file_index': file_index,
-            'timestamp': self.timestamps_flow[index],
+            'timestamp': self.timestamps_flow_start[index],
             'seq_name': self.seq_name
         }
-        # Save sample for benchmark submission
         output['save_submission'] = file_index in self.idx_to_visualize
         output['visualize'] = self.visualize_samples
-        event_data = self.event_slicer.get_events(
-            ts_start, ts_end)
-        p = event_data['p']
-        t = event_data['t']
-        x = event_data['x']
-        y = event_data['y']
 
-        xy_rect = self.rectify_events(x, y)
-        x_rect = xy_rect[:, 0]
-        y_rect = xy_rect[:, 1]
+        event_data1 = self.event_slicer.get_events(ts_start1, ts_end1)
+        event_data2 = self.event_slicer.get_events(ts_start2, ts_end2)
+
+        # Check data consistency after denoise
+        check_data_consistency(event_data1)
+        check_data_consistency(event_data2)
+
+        p1, t1, x1, y1 = event_data1['p'], event_data1['t'], event_data1['x'], event_data1['y']
+        p2, t2, x2, y2 = event_data2['p'], event_data2['t'], event_data2['x'], event_data2['y']
+
+        xy_rect1 = self.rectify_events(x1, y1)
+        x_rect1, y_rect1 = xy_rect1[:, 0], xy_rect1[:, 1]
+        xy_rect2 = self.rectify_events(x2, y2)
+        x_rect2, y_rect2 = xy_rect2[:, 0], xy_rect2[:, 1]
 
         if self.voxel_grid is None:
             raise NotImplementedError
         else:
-            event_representation = self.events_to_voxel_grid(
-                p, t, x_rect, y_rect)
+            event_representation1 = self.events_to_voxel_grid(p1, t1, x_rect1, y_rect1)
+            event_representation2 = self.events_to_voxel_grid(p2, t2, x_rect2, y_rect2)
+            event_representation = torch.cat((event_representation1, event_representation2), dim=0)
             output['event_volume'] = event_representation
         output['name_map'] = self.name_idx
-        
-        if self.load_gt:
-            output['flow_gt'
-                ] = [torch.tensor(x) for x in self.load_flow(self.flow_png[index])]
 
-            output['flow_gt'
-                ][0] = torch.moveaxis(output['flow_gt'][0], -1, 0)
-            output['flow_gt'
-                ][1] = torch.unsqueeze(output['flow_gt'][1], 0)
+        if self.load_gt and self.mode == "train":
+            output['flow_gt'] = [torch.tensor(x) for x in self.load_flow(self.flow_png[index])]
+            output['flow_gt'][0] = torch.moveaxis(output['flow_gt'][0], -1, 0)
+            output['flow_gt'][1] = torch.unsqueeze(output['flow_gt'][1], 0)
         return output
 
     def __getitem__(self, idx):
         sample = self.get_data(idx)
+        # 修正：5次元テンソルを4次元に変換
+        if sample['event_volume'].dim() == 5:
+            batch_size, seq_len, channels, height, width = sample['event_volume'].shape
+            sample['event_volume'] = sample['event_volume'].view(batch_size * seq_len, channels, height, width)
+        print(sample.size())
         return sample
 
     def get_voxel_grid(self, idx):
@@ -523,12 +702,17 @@ class SequenceRecurrent(Sequence):
                         elif isinstance(value, list) or isinstance(value, tuple):
                             sample[key] = [tf.functional.crop(
                                 v, i, j, h, w) for v in value]
-        return sequence
+        # ここでシーケンス次元をバッチ次元として扱う
+        batch = {key: torch.stack([seq[key] for seq in sequence]) for key in sequence[0]}
+        for key in batch:
+            if len(batch[key].shape) == 5:  # Check for 5D tensor
+                batch[key] = batch[key].view(-1, *batch[key].shape[2:])  # Combine sequence length and batch size
+        print(batch.size())
+        return batch
 
 
 class DatasetProvider:
-    def __init__(self, dataset_path: Path, representation_type: RepresentationType, delta_t_ms: int = 100, num_bins=4,
-                config=None, visualize=False):
+    def __init__(self, dataset_path: Path, representation_type: RepresentationType, delta_t_ms: int = 100, num_bins=4, config=None, visualize=False):
         test_path = Path(os.path.join(dataset_path, 'test'))
         train_path = Path(os.path.join(dataset_path, 'train'))
         assert dataset_path.is_dir(), str(dataset_path)
@@ -539,28 +723,23 @@ class DatasetProvider:
 
         # Assemble test sequences
         test_sequences = list()
-        for child in test_path.iterdir():
+        for i, child in enumerate(test_path.iterdir()):
             self.name_mapper_test.append(str(child).split("/")[-1])
-            test_sequences.append(Sequence(child, representation_type, 'test', delta_t_ms, num_bins,
-                                               transforms=[],
-                                               name_idx=len(
-                                                   self.name_mapper_test)-1,
-                                               visualize=visualize))
-
+            print(f"Loading test sequence: {child}")
+            test_sequences.append(Sequence(child, representation_type, 'test', delta_t_ms, num_bins, transforms=[], name_idx=len(self.name_mapper_test)-1, visualize=visualize))
         self.test_dataset = torch.utils.data.ConcatDataset(test_sequences)
 
         # Assemble train sequences
         available_seqs = os.listdir(train_path)
-
-        seqs = available_seqs
-
-        train_sequences: list[Sequence] = []
-        for seq in seqs:
+        train_sequences = []
+        for i, seq in enumerate(available_seqs):
+            print(f"Loading train sequence: {seq}")
             extra_arg = dict()
-            train_sequences.append(Sequence(Path(train_path) / seq,
-                                   representation_type=representation_type, mode="train",
-                                   load_gt=True, **extra_arg))
-            self.train_dataset: torch.utils.data.ConcatDataset[Sequence] = torch.utils.data.ConcatDataset(train_sequences)
+            train_sequences.append(Sequence(Path(train_path) / seq, representation_type=representation_type, mode="train", load_gt=True, **extra_arg))
+        self.train_dataset = torch.utils.data.ConcatDataset(train_sequences)
+
+        print(f"Total test sequences loaded: {len(test_sequences)}")
+        print(f"Total train sequences loaded: {len(train_sequences)}")
 
     def get_test_dataset(self):
         return self.test_dataset
@@ -568,17 +747,22 @@ class DatasetProvider:
     def get_train_dataset(self):
         return self.train_dataset
 
+    def get_preprocessed_train_dataset(self):
+        preprocessed_train_sequences = [PreprocessedDataset(seq) for seq in self.train_dataset.datasets]
+        return torch.utils.data.ConcatDataset(preprocessed_train_sequences)
+
+    def get_preprocessed_test_dataset(self):
+        preprocessed_test_sequences = [PreprocessedDataset(seq) for seq in self.test_dataset.datasets]
+        return torch.utils.data.ConcatDataset(preprocessed_test_sequences)
+
     def get_name_mapping_test(self):
         return self.name_mapper_test
 
     def summary(self, logger):
-        logger.write_line(
-            "================================== Dataloader Summary ====================================", True)
+        logger.write_line("================================== Dataloader Summary ====================================", True)
         logger.write_line("Loader Type:\t\t" + self.__class__.__name__, True)
-        logger.write_line("Number of Voxel Bins: {}".format(
-            self.test_dataset.datasets[0].num_bins), True)
-        logger.write_line("Number of Train Sequences: {}".format(
-            len(self.train_dataset)), True)
+        logger.write_line("Number of Voxel Bins: {}".format(self.test_dataset.datasets[0].num_bins), True)
+        logger.write_line("Number of Train Sequences: {}".format(len(self.train_dataset)), True)
 
 def train_collate(sample_list):
     batch = dict()

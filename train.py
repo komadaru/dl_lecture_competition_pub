@@ -16,17 +16,6 @@ import time
 import torch.nn.functional as F
 import pickle
 
-print("CUDA Available: ", torch.cuda.is_available())
-print("CUDA Version: ", torch.version.cuda)
-print("cuDNN Version: ", torch.backends.cudnn.version())
-
-
-# print("Torchaudio Version: ", torchaudio.__version__)
-
-class RepresentationType(Enum):
-    VOXEL = auto()
-    STEPAN = auto()
-
 
 def set_seed(seed):
     random.seed(seed)
@@ -35,7 +24,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
-
 
 def compute_epe_error(pred_flows: Dict[str, torch.Tensor], gt_flow: torch.Tensor):
     '''
@@ -77,31 +65,6 @@ def compute_multiscale_loss(pred_flows: Dict[str, torch.Tensor], target_flow: to
 
     return total_loss
 
-
-def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
-    '''
-    optical flowをnpyファイルに保存
-    flow: torch.Tensor, Shape: torch.Size([2, 480, 640]) => オプティカルフローデータ
-    file_name: str => ファイル名
-    '''
-    np.save(f"{file_name}.npy", flow.cpu().numpy())
-
-
-# 前処理を行い、前処理済みデータを保存する関数
-def preprocess_and_save(loader, save_dir):
-    preprocessed_train_dataset = loader.get_preprocessed_train_dataset()
-    preprocessed_test_dataset = loader.get_preprocessed_test_dataset()
-
-    # データをリストに変換して保存
-    train_data_list = [sample for sample in DataLoader(preprocessed_train_dataset, batch_size=1)]
-    test_data_list = [sample for sample in DataLoader(preprocessed_test_dataset, batch_size=1)]
-
-    with open(save_dir / 'preprocessed_train_dataset.pkl', 'wb') as f:
-        pickle.dump(train_data_list, f)
-
-    with open(save_dir / 'preprocessed_test_dataset.pkl', 'wb') as f:
-        pickle.dump(test_data_list, f)
-
 # 前処理済みデータを読み込む関数
 def load_preprocessed_data(save_dir):
     with open(save_dir / 'preprocessed_train_dataset.pkl', 'rb') as f:
@@ -112,64 +75,11 @@ def load_preprocessed_data(save_dir):
 
     return preprocessed_train_dataset, preprocessed_test_dataset
 
-# 前処理済みデータを再構築するためのカスタムデータセットクラス
-class CustomDataset(Dataset):
-    def __init__(self, data_list):
-        self.data_list = data_list
-
-    def __len__(self):
-        return len(self.data_list)
-
-    def __getitem__(self, idx):
-        return self.data_list[idx]
-
-
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
+    save_dir = Path(args.save_dir)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
-    '''
-        ディレクトリ構造:
-
-        data
-        ├─test
-        |  ├─test_city
-        |  |    ├─events_left
-        |  |    |   ├─events.h5
-        |  |    |   └─rectify_map.h5
-        |  |    └─forward_timestamps.txt
-        └─train
-            ├─zurich_city_11_a
-            |    ├─events_left
-            |    |       ├─ events.h5
-            |    |       └─ rectify_map.h5
-            |    ├─ flow_forward
-            |    |       ├─ 000134.png
-            |    |       |.....
-            |    └─ forward_timestamps.txt
-            ├─zurich_city_11_b
-            └─zurich_city_11_c
-        '''
-
-    # ------------------
-    #    Dataloader
-    # ------------------
-    dataset_path = Path(args.dataset_path)
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    # DatasetProviderを作成
-    loader = DatasetProvider(
-        dataset_path=dataset_path,
-        representation_type=RepresentationType.VOXEL,
-        delta_t_ms=100,
-        num_bins=4,
-    )
-
-    # データの前処理と保存
-    preprocess_and_save(loader, save_dir)
-
     # 前処理済みデータを読み込み
     preprocessed_train_dataset, preprocessed_test_dataset = load_preprocessed_data(save_dir)
 
@@ -189,7 +99,7 @@ def main(args: DictConfig):
         Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
         Key: flow_gt, Type: torch.Tensor, Shape: torch.Size([Batch, 2, 480, 640]) => オプティカルフローデータのバッチ
         Key: flow_gt_valid_mask, Type: torch.Tensor, Shape: torch.Size([Batch, 1, 480, 640]) => オプティカルフローデータのvalid. ベースラインでは使わない
-
+    
     test data:
         Type of batch: Dict
         Key: seq_name, Type: list
@@ -229,10 +139,10 @@ def main(args: DictConfig):
 
 
             # Check if the average loss is below the threshold
-            if epe_error < 4.0:
+            if epe_error < 15.0:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = args.train.low_lr
-            elif epe_error < 3.5:
+            elif epe_error < 9.0:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = args.train.low_lr2
         print(f'Epoch {epoch + 1}, Loss: {total_loss / len(train_data)}')
@@ -251,29 +161,6 @@ def main(args: DictConfig):
     model_path = f"checkpoints/model_{current_time}.pth"
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
-
-    # ------------------
-    #   Start predicting
-    # ------------------
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    flow: torch.Tensor = torch.tensor([]).to(device)
-    with torch.no_grad():
-        print("start test")
-        for batch in tqdm(test_data):
-            batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device)
-            # batch_flow = model(event_image) # [1, 2, 480, 640]
-            batch_flow_dict = model(event_image)
-            batch_flow = batch_flow_dict['flow3']  # 最後のスケールのフロー
-            flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
-        print("test done")
-    # ------------------
-    #  save submission
-    # ------------------
-    file_name = "submission"
-    save_optical_flow_to_npy(flow, file_name)
-
 
 if __name__ == "__main__":
     main()

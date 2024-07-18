@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from src.models.base import *
+from .base import *
 from typing import Dict, Any
 
 _BASE_CHANNELS = 64
@@ -10,7 +10,7 @@ class EVFlowNet(nn.Module):
         super(EVFlowNet,self).__init__()
         self._args = args
 
-        self.encoder1 = general_conv2d(in_channels = 4, out_channels=_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
+        self.encoder1 = general_conv2d(in_channels = 8, out_channels=_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
         self.encoder2 = general_conv2d(in_channels = _BASE_CHANNELS, out_channels=2*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
         self.encoder3 = general_conv2d(in_channels = 2*_BASE_CHANNELS, out_channels=4*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
         self.encoder4 = general_conv2d(in_channels = 4*_BASE_CHANNELS, out_channels=8*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
@@ -30,6 +30,11 @@ class EVFlowNet(nn.Module):
                         out_channels=int(_BASE_CHANNELS/2), do_batch_norm=not self._args.no_batch_norm)
 
     def forward(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # 入力の形状を確認して変換
+        if inputs.dim() == 5:  # 5次元テンソルの場合（バッチサイズ、シーケンス長、チャンネル、高さ、幅）
+            batch_size, seq_len, channels, height, width = inputs.shape
+            inputs = inputs.view(batch_size * seq_len, channels, height, width)  # 4次元に変換（バッチサイズ * シーケンス長、チャンネル、高さ、幅）
+
         # encoder
         skip_connections = {}
         inputs = self.encoder1(inputs)
@@ -62,7 +67,7 @@ class EVFlowNet(nn.Module):
         inputs, flow = self.decoder4(inputs)
         flow_dict['flow3'] = flow.clone()
 
-        return flow
+        return flow_dict
         
 
 # if __name__ == "__main__":
